@@ -1,0 +1,18 @@
+# 核心系统与 LuCI
+bash ca-bundle curl wget unzip openssl-util htop nano vim-full
+luci luci-ssl luci-compat luci-base luci-proto-ppp
+luci-app-firewall luci-app-opkg
+# 网络/旁路由基础
+dnsmasq-full ip-full ipset conntrack-tools ethtool tcpdump tcpdump-mini mtr iperf3 socat
+kmod-tun kmod-inet-diag kmod-nft-tproxy kmod-nft-offload nftables
+# 性能/基础库
+zram-swap
+# 代理/核心（全部默认停用）
+luci-app-openclash luci-i18n-openclash-zh-cn
+luci-app-passwall luci-i18n-passwall-zh-cn
+luci-app-passwall2 luci-i18n-passwall2-zh-cn
+luci-app-nikki luci-i18n-nikki-zh-cn nikki mihomo-meta
+luci-app-homeproxy sing-box
+luci-app-mosdns mosdns v2ray-geodata luci-i18n-mosdns-zh-cn
+xray-core
+smartdns luci-app-smartdns luci-i18n-smartdns-zh-cn

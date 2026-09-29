@@ -1,0 +1,5 @@
+Package strategy:
+- OpenClash/PassWall/PassWall2/Nikki/HomeProxy/MosDNS are source feeds compiled against ImmortalWrt 24.10.6.
+- Open-Box is kept as a first-class installer script because its upstream project publishes a dynamic latest installer rather than a stable ImmortalWrt package feed.
+- DAED is optional in the workflow because its eBPF/BTF requirements change more frequently than the core 24.10 baseline.
+- No user subscription URLs/tokens are included.
