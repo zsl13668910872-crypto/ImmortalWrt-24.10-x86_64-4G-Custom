@@ -1,0 +1,122 @@
+name: Build ImmortalWrt 24.10 x86_64 4G EFI
+
+on:
+  workflow_dispatch:
+    inputs:
+      install_daed:
+        description: '尝试额外集成 daed/dae（默认关闭，24.10 基线更稳）'
+        required: false
+        default: 'false'
+      publish_release:
+        description: '构建成功后发布 GitHub Release'
+        required: false
+        default: 'false'
+
+env:
+  IMMORTAL_VERSION: '24.10.6'
+  ROOTFS_PARTSIZE: '4096'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout custom build repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses5-dev \
+            libssl-dev python3-setuptools rsync unzip zlib1g-dev file wget curl time \
+            libelf-dev ecj fastjar java-propose-classpath python3 \
+            swig zstd subversion xsltproc qemu-utils
+
+      - name: Clone ImmortalWrt 24.10.6
+        run: |
+          git clone --branch "v${IMMORTAL_VERSION}" --depth 1 \
+            https://github.com/immortalwrt/immortalwrt.git immortalwrt
+          cp config/seed.config immortalwrt/.config
+
+      - name: Add third-party feeds
+        working-directory: immortalwrt
+        run: |
+          cat >> feeds.conf.default <<'EOF'
+          src-git openclash https://github.com/vernesong/OpenClash.git
+          src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git
+          src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git
+          src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git
+          src-git mosdns https://github.com/sbwml/luci-app-mosdns.git
+          src-git homeproxy https://github.com/immortalwrt/homeproxy.git
+          EOF
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Select packages
+        working-directory: immortalwrt
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          cfg = Path('.config').read_text()
+          lines = []
+          want = []
+          for raw in Path('../config/packages.txt').read_text().splitlines():
+              raw = raw.strip()
+              if raw and not raw.startswith('#'):
+                  want.extend(raw.split())
+          for p in want:
+              key = 'CONFIG_PACKAGE_' + p
+              lines.append(f'{key}=y')
+          Path('.config').write_text(cfg + '\n' + '\n'.join(lines) + '\n')
+          PY
+          make defconfig
+
+      - name: Optional daed feed
+        if: inputs.install_daed == 'true'
+        working-directory: immortalwrt
+        run: |
+          echo 'src-git daede https://github.com/kenzok8/openwrt-daede.git' >> feeds.conf.default
+          ./scripts/feeds update daede
+          ./scripts/feeds install -a -p daede
+          echo 'CONFIG_PACKAGE_luci-app-daede=y' >> .config
+          echo 'CONFIG_PACKAGE_dae=y' >> .config
+          echo 'CONFIG_PACKAGE_daed=y' >> .config
+          make defconfig
+
+      - name: Inject custom files before image build
+        working-directory: immortalwrt
+        run: |
+          rsync -a ../files/ files/
+
+      - name: Build toolchain/package/image
+        working-directory: immortalwrt
+        env:
+          FORCE_UNSAFE_CONFIGURE: '1'
+        run: |
+          make -j"$(nproc)" download V=s
+          make -j"$(nproc)" world V=s
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp -a immortalwrt/bin/targets/x86/64/* out/
+          sha256sum out/* > out/sha256sums.txt || true
+          ls -lah out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-24.10.6-x86_64-4G-efi
+          path: out/*
+          retention-days: 14
+
+      - name: Publish release
+        if: inputs.publish_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "custom-24.10.6-x86_64-4G-${{ github.run_number }}"
+          name: "ImmortalWrt 24.10.6 x86_64 4G EFI #${{ github.run_number }}"
+          files: out/*
+          generate_release_notes: true
