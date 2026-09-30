@@ -1,0 +1,672 @@
+name: Build ImmortalWrt 24.10.6 RouterOS Bypass Stable V2
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_backup_proxy:
+        description: '预装 PassWall / PassWall2 作为备用代理栈（默认开启，但默认不启动）'
+        required: false
+        type: boolean
+        default: true
+      enable_extra_proxy_stacks:
+        description: '额外集成 Nikki / HomeProxy / MosDNS / SmartDNS（稳定优先，默认关闭）'
+        required: false
+        type: boolean
+        default: false
+      enable_bbr:
+        description: '可选：启用 BBR（稳定优先默认关闭；请先完成 V1/V2 对照测试）'
+        required: false
+        type: boolean
+        default: false
+      publish_release:
+        description: '构建成功后发布 GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  IMMORTAL_VERSION: '24.10.6'
+  ROOTFS_PARTSIZE: '4096'
+  OPENCLASH_VERSION: '0.47.156'
+  V2_VERSION: 'V2.1-stability-first'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout custom build repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses5-dev \
+            libssl-dev python3-setuptools rsync unzip zlib1g-dev file wget curl time \
+            libelf-dev ecj fastjar java-propose-classpath python3 \
+            swig zstd subversion xsltproc qemu-utils \
+            ccache xz-utils patch perl tar gzip bzip2 unzip p7zip-full
+
+      - name: Clone ImmortalWrt 24.10.6
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --branch "v${IMMORTAL_VERSION}" --single-branch --depth 1 \
+            https://github.com/immortalwrt/immortalwrt.git immortalwrt
+
+      - name: Cache downloaded source archives
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/dl
+          key: immortalwrt-${{ env.IMMORTAL_VERSION }}-${{ hashFiles('.github/workflows/ImmortalWrt-24.10.6-RouterOS-Bypass-Stable-V2-build.yml', '.github/workflows/build.yml') }}
+          restore-keys: |
+            immortalwrt-${{ env.IMMORTAL_VERSION }}-
+
+      - name: Configure target and stable package baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd immortalwrt
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_TARGET_BOARD="x86"
+          CONFIG_TARGET_SUBTARGET="64"
+          CONFIG_TARGET_PROFILE="DEVICE_generic"
+          CONFIG_TARGET_ARCH_PACKAGES="x86_64"
+          CONFIG_x86_64=y
+          CONFIG_ARCH="x86_64"
+
+          CONFIG_TARGET_ROOTFS_EXT4FS=y
+          CONFIG_TARGET_EXT4_RESERVED_PCT=0
+          CONFIG_TARGET_EXT4_BLOCKSIZE_4K=y
+          CONFIG_TARGET_EXT4_BLOCKSIZE=4096
+          CONFIG_TARGET_EXT4_JOURNAL=y
+          CONFIG_GRUB_IMAGES=y
+          CONFIG_GRUB_EFI_IMAGES=y
+          CONFIG_GRUB_CONSOLE=y
+          CONFIG_GRUB_BAUDRATE=115200
+          CONFIG_GRUB_TIMEOUT="3"
+          CONFIG_TARGET_KERNEL_PARTSIZE=16
+          CONFIG_TARGET_ROOTFS_PARTSIZE=4096
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_PACKAGE_grub2=y
+          CONFIG_PACKAGE_grub2-efi=y
+
+          # Network / proxy runtime prerequisites
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_wget-ssl=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_ethtool=y
+          CONFIG_PACKAGE_tcpdump=y
+          CONFIG_PACKAGE_iperf3=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_jq=y
+          CONFIG_PACKAGE_procps-ng=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-veth=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_bind-host=y
+          CONFIG_PACKAGE_bind-dig=y
+
+          # OpenClash fixed baseline: source is pinned to v0.47.156 below.
+          CONFIG_PACKAGE_luci-app-openclash=y
+          EOF
+
+          # Stability-first: do not force BBR. The workflow can enable it as an explicit experiment.
+          if [ '${{ inputs.enable_bbr }}' = 'true' ]; then
+            echo 'CONFIG_PACKAGE_kmod-tcp-bbr=y' >> .config
+          fi
+
+          # Add the official OpenClash v0.47.156 source tree directly so the build is not tied to a moving feed head.
+          rm -rf package/openclash
+          git clone --branch "v${OPENCLASH_VERSION}" --single-branch --depth 1 \
+            https://github.com/vernesong/OpenClash.git package/openclash
+
+      - name: Add optional proxy feeds
+        if: inputs.enable_backup_proxy == true || inputs.enable_extra_proxy_stacks == true
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ '${{ inputs.enable_backup_proxy }}' = 'true' ]; then
+            cat >> feeds.conf.default <<'EOF'
+          src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git
+          src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git
+          EOF
+          fi
+
+          if [ '${{ inputs.enable_extra_proxy_stacks }}' = 'true' ]; then
+            cat >> feeds.conf.default <<'EOF'
+          src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git
+          src-git homeproxy https://github.com/immortalwrt/homeproxy.git
+          src-git mosdns https://github.com/sbwml/luci-app-mosdns.git
+          EOF
+          fi
+
+          # Optional feeds must never turn a stability-first build into a hard failure.
+          # Missing/unreachable optional feeds are reported and their packages are simply omitted.
+          if [ '${{ inputs.enable_backup_proxy }}' = 'true' ]; then
+            ./scripts/feeds update passwall || echo '[WARN] passwall feed update failed; backup proxy will be omitted.'
+            ./scripts/feeds update passwall2 || echo '[WARN] passwall2 feed update failed; backup proxy will be omitted.'
+            ./scripts/feeds install -a -p passwall || true
+            ./scripts/feeds install -a -p passwall2 || true
+          fi
+
+          if [ '${{ inputs.enable_extra_proxy_stacks }}' = 'true' ]; then
+            ./scripts/feeds update nikki || echo '[WARN] nikki feed update failed; nikki will be omitted.'
+            ./scripts/feeds update homeproxy || echo '[WARN] homeproxy feed update failed; homeproxy will be omitted.'
+            ./scripts/feeds update mosdns || echo '[WARN] mosdns feed update failed; mosdns will be omitted.'
+            ./scripts/feeds install -a -p nikki || true
+            ./scripts/feeds install -a -p homeproxy || true
+            ./scripts/feeds install -a -p mosdns || true
+          fi
+
+      - name: Select optional packages safely
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          add_if_present() {
+            local pkg="$1"
+            if find package feeds -type d -name "$pkg" -print -quit 2>/dev/null | grep -q .; then
+              echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+              echo "[OK] ${pkg}"
+            else
+              echo "[WARN] skip unavailable package: ${pkg}"
+            fi
+          }
+
+          # Required package sanity check
+          if ! find package/openclash -maxdepth 2 -type f -name Makefile -print -quit | grep -q .; then
+            echo '[FATAL] OpenClash source tree not found.' >&2
+            exit 1
+          fi
+
+          if [ '${{ inputs.enable_backup_proxy }}' = 'true' ]; then
+            add_if_present luci-app-passwall
+            add_if_present luci-app-passwall2
+          fi
+
+          if [ '${{ inputs.enable_extra_proxy_stacks }}' = 'true' ]; then
+            add_if_present luci-app-nikki
+            add_if_present luci-app-homeproxy
+            add_if_present luci-app-mosdns
+            add_if_present luci-app-smartdns
+            add_if_present smartdns
+            add_if_present xray-core
+            add_if_present sing-box
+          fi
+
+          make defconfig
+
+      - name: Inject RouterOS bypass V2 stable runtime files
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p files/etc/uci-defaults
+          mkdir -p files/etc/openclash/custom
+          mkdir -p files/etc/sysctl.d
+          mkdir -p files/usr/bin
+          mkdir -p files/etc/init.d
+          mkdir -p files/etc/config
+          mkdir -p files/root
+
+          # ------------------------------------------------------------------
+          # Fixed OKTV rules. These are static compatibility rules.
+          # ------------------------------------------------------------------
+          cat > files/etc/openclash/custom/openclash_custom_rules.list <<'EOF'
+          - DOMAIN-SUFFIX,hidns.vip,DIRECT
+          - DOMAIN-SUFFIX,cmliussss.com,DIRECT
+          - DOMAIN-SUFFIX,090227.xyz,DIRECT
+          - DOMAIN,tvbbox.pgjgr.eu.cc,DIRECT
+          EOF
+
+          # ------------------------------------------------------------------
+          # Conservative sysctl baseline. No forced MTU/RPS/XPS/IRQ pinning.
+          # ------------------------------------------------------------------
+          cat > files/etc/sysctl.d/98-routeros-bypass-v2.conf <<'EOF'
+          # RouterOS main router + ImmortalWrt bypass router V2
+          # Stability first: conservative values only.
+          net.ipv4.tcp_slow_start_after_idle = 0
+          net.ipv4.tcp_moderate_rcvbuf = 1
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.ip_forward = 1
+          net.core.rmem_max = 4194304
+          net.core.wmem_max = 4194304
+          net.ipv4.tcp_rmem = 4096 131072 4194304
+          net.ipv4.tcp_wmem = 4096 131072 4194304
+          net.ipv4.udp_rmem_min = 16384
+          net.ipv4.udp_wmem_min = 16384
+          EOF
+
+          # ------------------------------------------------------------------
+          # Apply/rollback command. It intentionally does NOT modify LAN IP,
+          # gateway or physical interfaces.
+          # ------------------------------------------------------------------
+          cat > files/usr/bin/routeros-bypass-apply <<'EOF'
+          #!/bin/sh
+          set -u
+
+          log() { logger -t routeros-bypass-v2 -- "$*"; echo "$*"; }
+          uget() { uci -q get "$1" 2>/dev/null || true; }
+
+          case "${1:-apply}" in
+            apply)
+              log "Applying RouterOS-bypass stable baseline..."
+
+              # Do not create a second LAN DHCP authority.
+              if uci -q get dhcp.lan >/dev/null 2>&1; then
+                uci set dhcp.lan.ignore='1'
+                uci set dhcp.lan.ra='disabled'
+                uci set dhcp.lan.dhcpv6='disabled'
+                uci set dhcp.lan.ndp='disabled'
+              fi
+
+              # Disable IPv6 service advertisement on odhcpd when present.
+              for s in $(uci show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=odhcpd$/\1/p'); do
+                uci set "dhcp.${s}.ra=disabled" 2>/dev/null || true
+                uci set "dhcp.${s}.dhcpv6=disabled" 2>/dev/null || true
+                uci set "dhcp.${s}.ndp=disabled" 2>/dev/null || true
+              done
+
+              # Keep firewall4 offload disabled for TUN/transparent-proxy stability.
+              if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+                uci set firewall.@defaults[0].flow_offloading='0'
+                uci set firewall.@defaults[0].flow_offloading_hw='0'
+              fi
+
+              # OpenClash is the only primary DNS/TUN controller.
+              if uci -q get openclash.config >/dev/null 2>&1; then
+                uci set openclash.config.enable_custom_clash_rules='1' 2>/dev/null || true
+                uci set openclash.config.enable_respect_rules='1' 2>/dev/null || true
+                uci set openclash.config.enable_redirect_dns='1' 2>/dev/null || true
+                uci set openclash.config.en_mode='fake-ip-tun' 2>/dev/null || true
+                uci set openclash.config.stack_type='mixed' 2>/dev/null || true
+                uci set openclash.config.disable_masq_cache='1' 2>/dev/null || true
+                uci set openclash.config.skip_proxy_address='1' 2>/dev/null || true
+                uci set openclash.config.ipv6_enable='0' 2>/dev/null || true
+              fi
+
+              # Only enable the DNS 53 -> 1053 chain after a usable OpenClash YAML exists.
+              yaml=''
+              for f in /etc/openclash/config/*.yaml /etc/openclash/config/*.yml; do
+                [ -s "$f" ] || continue
+                [ -z "$yaml" ] && yaml="$f"
+              done
+
+              if [ -n "$yaml" ] && uci -q get openclash.config >/dev/null 2>&1; then
+                if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
+                  uci set dhcp.@dnsmasq[0].noresolv='1'
+                  uci -q delete dhcp.@dnsmasq[0].server
+                  uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#1053'
+                fi
+                uci commit dhcp
+                uci commit openclash
+                /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+                /etc/init.d/openclash enable >/dev/null 2>&1 || true
+                /etc/init.d/openclash restart >/dev/null 2>&1 || true
+                log "DNS chain enabled: dnsmasq :53 -> OpenClash 127.0.0.1:1053"
+              else
+                log "No usable OpenClash YAML yet; keeping normal system DNS to avoid a half-installed DNS outage."
+              fi
+
+              uci commit dhcp 2>/dev/null || true
+              uci commit firewall 2>/dev/null || true
+              uci commit openclash 2>/dev/null || true
+              /etc/init.d/firewall reload >/dev/null 2>&1 || true
+              sysctl --system >/dev/null 2>&1 || true
+              exit 0
+              ;;
+
+            direct)
+              log "Restoring direct DNS mode (rollback)."
+              if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
+                uci set dhcp.@dnsmasq[0].noresolv='0'
+                uci -q delete dhcp.@dnsmasq[0].server
+              fi
+              uci commit dhcp 2>/dev/null || true
+              /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+              /etc/init.d/openclash stop >/dev/null 2>&1 || true
+              exit 0
+              ;;
+
+            *)
+              echo "Usage: routeros-bypass-apply [apply|direct]"
+              exit 1
+              ;;
+          esac
+          EOF
+          chmod 755 files/usr/bin/routeros-bypass-apply
+
+          # ------------------------------------------------------------------
+          # Health monitor. It only restarts local services when the local DNS
+          # chain is broken. A remote tvbbox/Google failure never triggers a
+          # reboot, avoiding unstable restart loops.
+          # ------------------------------------------------------------------
+          cat > files/usr/bin/routeros-bypass-health <<'EOF'
+          #!/bin/sh
+          set -u
+
+          TAG=routeros-bypass-health
+          LOCK=/var/run/routeros-bypass-health.lock
+          LOG=/var/log/routeros-bypass-health.log
+          MAX=5242880
+
+          mkdir "$LOCK" 2>/dev/null || exit 0
+          trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+          log() {
+            line="$(date '+%F %T') $*"
+            logger -t "$TAG" -- "$*"
+            printf '%s\n' "$line" >> "$LOG"
+            [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$MAX" ] && tail -c 2621440 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+          }
+
+          # No configured OpenClash profile: do not interfere with user setup.
+          uci -q get openclash.config >/dev/null 2>&1 || exit 0
+          [ "$(uci -q get openclash.config.enable 2>/dev/null || echo 0)" = "1" ] || exit 0
+
+          yaml_found=0
+          for f in /etc/openclash/config/*.yaml /etc/openclash/config/*.yml; do
+            [ -s "$f" ] && yaml_found=1 && break
+          done
+          [ "$yaml_found" -eq 1 ] || exit 0
+
+          # Local service checks only.
+          if ! pgrep -f 'clash_meta|mihomo' >/dev/null 2>&1; then
+            log "Mihomo/OpenClash core process absent; restarting OpenClash."
+            /etc/init.d/openclash restart >/dev/null 2>&1 || true
+            sleep 5
+          fi
+
+          # Check dnsmasq local endpoint. Remote service failures are log-only.
+          if command -v nslookup >/dev/null 2>&1; then
+            if ! nslookup tvbbox.pgjgr.eu.cc 127.0.0.1 >/dev/null 2>&1; then
+              log "Local DNS check failed for tvbbox; restarting dnsmasq and OpenClash once."
+              /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+              /etc/init.d/openclash restart >/dev/null 2>&1 || true
+              sleep 5
+              if ! nslookup tvbbox.pgjgr.eu.cc 127.0.0.1 >/dev/null 2>&1; then
+                log "Local DNS still failing after restart; no reboot will be attempted."
+              fi
+            fi
+          fi
+
+          # Observe remote availability without triggering restarts.
+          if command -v curl >/dev/null 2>&1; then
+            curl -4 -fsS -I --max-time 8 https://tvbbox.pgjgr.eu.cc/ >/dev/null 2>&1 \
+              && log "OKTV remote HTTPS check: PASS" \
+              || log "OKTV remote HTTPS check: FAIL (observation only)"
+            curl -4 -fsS --max-time 8 https://www.gstatic.com/generate_204 >/dev/null 2>&1 \
+              && log "Google 204 check: PASS" \
+              || log "Google 204 check: FAIL (observation only)"
+          fi
+          EOF
+          chmod 755 files/usr/bin/routeros-bypass-health
+
+          # ------------------------------------------------------------------
+          # Init script: apply static sysctl and create health timer.
+          # ------------------------------------------------------------------
+          cat > files/etc/init.d/routeros-bypass-v2 <<'EOF'
+          #!/bin/sh /etc/rc.common
+          START=95
+          STOP=05
+          USE_PROCD=0
+
+          start() {
+            sysctl --system >/dev/null 2>&1 || true
+
+            # Dynamic conntrack ceiling according to installed RAM.
+            mem_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 2048)
+            if [ "$mem_mb" -ge 6144 ]; then
+              max=262144
+            elif [ "$mem_mb" -ge 3072 ]; then
+              max=131072
+            else
+              max=65536
+            fi
+            sysctl -w "net.netfilter.nf_conntrack_max=$max" >/dev/null 2>&1 || true
+
+            # Do not touch RPS/XPS/IRQ or NIC offload state.
+            logger -t routeros-bypass-v2 "stable baseline loaded; conntrack_max=$max"
+            /usr/bin/routeros-bypass-apply apply >/dev/null 2>&1 || true
+          }
+
+          stop() { :; }
+          EOF
+          chmod 755 files/etc/init.d/routeros-bypass-v2
+
+          # ------------------------------------------------------------------
+          # First-boot UCI setup. It is idempotent and never changes LAN IP,
+          # gateway, physical interface binding or RouterOS configuration.
+          # ------------------------------------------------------------------
+          cat > files/etc/uci-defaults/99-routeros-bypass-v2 <<'EOF'
+          #!/bin/sh
+          set -u
+          
+          # Stable IPv4-only bypass-router baseline.
+          if uci -q get dhcp.lan >/dev/null 2>&1; then
+            uci set dhcp.lan.ignore='1'
+            uci set dhcp.lan.ra='disabled'
+            uci set dhcp.lan.dhcpv6='disabled'
+            uci set dhcp.lan.ndp='disabled'
+          fi
+
+          # Keep IPv6 service advertisements off on odhcpd sections when present.
+          for s in $(uci show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=odhcpd$/\1/p'); do
+            uci set "dhcp.${s}.ra=disabled" 2>/dev/null || true
+            uci set "dhcp.${s}.dhcpv6=disabled" 2>/dev/null || true
+            uci set "dhcp.${s}.ndp=disabled" 2>/dev/null || true
+          done
+
+          # firewall4 offloading stays disabled for the proxy/TUN path.
+          if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+            uci set firewall.@defaults[0].flow_offloading='0'
+            uci set firewall.@defaults[0].flow_offloading_hw='0'
+          fi
+
+          uci commit dhcp 2>/dev/null || true
+          uci commit firewall 2>/dev/null || true
+
+          # OpenClash defaults: only the safe/static knobs. Do not auto-enable
+          # the service when the user has not imported a valid YAML yet.
+          if uci -q get openclash.config >/dev/null 2>&1; then
+            uci set openclash.config.enable_custom_clash_rules='1' 2>/dev/null || true
+            uci set openclash.config.enable_respect_rules='1' 2>/dev/null || true
+            uci set openclash.config.enable_redirect_dns='1' 2>/dev/null || true
+            uci set openclash.config.en_mode='fake-ip-tun' 2>/dev/null || true
+            uci set openclash.config.stack_type='mixed' 2>/dev/null || true
+            uci set openclash.config.disable_masq_cache='1' 2>/dev/null || true
+            uci set openclash.config.skip_proxy_address='1' 2>/dev/null || true
+            uci set openclash.config.ipv6_enable='0' 2>/dev/null || true
+            uci commit openclash || true
+          fi
+
+          # Keep Open-Box installed as a backup installer, but do not start it.
+          for s in /etc/init.d/openbox /etc/init.d/open-box; do
+            if [ -x "$s" ]; then
+              "$s" stop >/dev/null 2>&1 || true
+              "$s" disable >/dev/null 2>&1 || true
+            fi
+          done
+
+          /etc/init.d/routeros-bypass-v2 enable >/dev/null 2>&1 || true
+          /etc/init.d/routeros-bypass-v2 start >/dev/null 2>&1 || true
+
+          # Add a lightweight 5-minute health check if not already present.
+          CRON=/etc/crontabs/root
+          touch "$CRON"
+          grep -q '/usr/bin/routeros-bypass-health' "$CRON" 2>/dev/null || \
+            echo '*/5 * * * * /usr/bin/routeros-bypass-health >/dev/null 2>&1' >> "$CRON"
+
+          rm -f /etc/uci-defaults/99-routeros-bypass-v2
+          exit 0
+          EOF
+          chmod 755 files/etc/uci-defaults/99-routeros-bypass-v2
+
+          # OpenBox dynamic installer helper (actual version is resolved by upstream installer).
+          cat > files/root/openbox-install-latest.sh <<'EOF'
+          #!/bin/sh
+          set -eu
+          dest=/tmp/openbox-install.sh
+          urls="\
+          https://gh-proxy.org/https://raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh \
+          https://gh-proxy.com/raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh \
+          https://ghproxy.net/raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh \
+          https://ghfast.top/raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/install.sh"
+          ok=0
+          for u in $urls; do
+            if curl -4 -L --fail --connect-timeout 10 --max-time 120 -o "$dest" "$u"; then
+              if head -n 1 "$dest" | grep -q '^#!/bin/sh$' && grep -q 'REPO="liandu2024/Open-Box"' "$dest"; then
+                ok=1
+                break
+              fi
+            fi
+          done
+          [ "$ok" -eq 1 ] || { echo 'Open-Box installer download failed.' >&2; exit 1; }
+          chmod 700 "$dest"
+          exec sh "$dest" --mirror --port 3036
+          EOF
+          chmod 700 files/root/openbox-install-latest.sh
+
+          # README inside the firmware root explaining what is fixed vs dynamic.
+          cat > files/root/ROUTEROS-BYPASS-V2-README.txt <<'EOF'
+          ImmortalWrt 24.10.6 RouterOS 主路由 + 旁路由 稳定 V2
+
+          Fixed/static:
+          - IPv4-only policy on the bypass router; DHCP/RA/DHCPv6 off.
+          - OpenClash primary DNS/TUN controller.
+          - DNS chain target: 127.0.0.1:1053 (enabled only after a usable OpenClash YAML exists).
+          - Fake-IP-TUN baseline, mixed stack, respect-rules and custom rules.
+          - Flow offloading/Turbo-ACC style acceleration is not enabled.
+          - OKTV direct rules: hidns.vip / cmliussss.com / 090227.xyz / tvbbox.pgjgr.eu.cc
+          - Conservative TCP/UDP buffers; no forced MTU, RPS/XPS or IRQ pinning.
+          - Open-Box is backup only and disabled by default.
+
+          Dynamic:
+          - Airport subscription nodes, health, latency and switching.
+          - Cloudflare/Google CDN IP selection.
+          - GeoIP/GeoSite databases.
+          - CPU/memory-dependent conntrack ceiling.
+          - RPS/XPS/IRQ remain untouched unless manually tested and enabled.
+
+          Useful commands:
+          routeros-bypass-apply apply
+          routeros-bypass-apply direct
+          routeros-bypass-health
+          EOF
+
+      - name: Optional BBR post-config guard
+        if: inputs.enable_bbr == true
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/98-enable-bbr-optional <<'EOF'
+          # Optional experiment only. If the kernel does not expose BBR, keep the default.
+          avail="$(sysctl -n net.ipv4.tcp_allowed_congestion_control 2>/dev/null || true)"
+          case " $avail " in
+            *" bbr "*) sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true ;;
+          esac
+          rm -f /etc/uci-defaults/98-enable-bbr-optional
+          EOF
+          chmod 755 files/etc/uci-defaults/98-enable-bbr-optional
+
+      - name: Finalize config and verify required target
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          make defconfig
+
+          echo '===== TARGET CHECK ====='
+          grep -E '^(CONFIG_TARGET_x86_64_DEVICE_generic|CONFIG_TARGET_ROOTFS_EXT4FS|CONFIG_TARGET_ROOTFS_PARTSIZE|CONFIG_GRUB_EFI_IMAGES|CONFIG_PACKAGE_luci-app-openclash)=' .config || true
+
+          echo '===== OPENCLASH CHECK ====='
+          grep -n '^PKG_VERSION' package/openclash/luci-app-openclash/Makefile | head -n 1
+
+          test "$(grep -c '^CONFIG_TARGET_x86_64_DEVICE_generic=y' .config || true)" -eq 1
+          test "$(grep -c '^CONFIG_TARGET_ROOTFS_PARTSIZE=4096' .config || true)" -eq 1
+          test "$(grep -c '^CONFIG_GRUB_EFI_IMAGES=y' .config || true)" -eq 1
+          test -f files/etc/uci-defaults/99-routeros-bypass-v2
+          test -f files/usr/bin/routeros-bypass-health
+          test -f files/etc/openclash/custom/openclash_custom_rules.list
+
+      - name: Download all sources
+        working-directory: immortalwrt
+        env:
+          FORCE_UNSAFE_CONFIGURE: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" download V=s
+
+      - name: Build ImmortalWrt image
+        working-directory: immortalwrt
+        env:
+          FORCE_UNSAFE_CONFIGURE: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" world V=s
+
+      - name: Collect firmware and diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp -a immortalwrt/bin/targets/x86/64/* out/
+
+          {
+            echo "ImmortalWrt=${IMMORTAL_VERSION}"
+            echo "Profile=x86_64 generic EFI"
+            echo "ROOTFS_PARTSIZE=${ROOTFS_PARTSIZE} MiB"
+            echo "OpenClash=${OPENCLASH_VERSION}"
+            echo "V2=${V2_VERSION}"
+            echo "BackupProxy=${{ inputs.enable_backup_proxy }}"
+            echo "ExtraProxyStacks=${{ inputs.enable_extra_proxy_stacks }}"
+            echo "BBR=${{ inputs.enable_bbr }}"
+            echo "WorkflowRun=${GITHUB_RUN_ID}"
+            echo "WorkflowRunNumber=${GITHUB_RUN_NUMBER}"
+          } > out/build-info.txt
+
+          (cd out && sha256sum ./*.img* ./*.gz ./*.bin 2>/dev/null || true) > out/sha256sums.txt
+          ls -lah out
+          echo '===== BUILD INFO ====='
+          cat out/build-info.txt
+          echo '===== SHA256 ====='
+          cat out/sha256sums.txt
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-24.10.6-x86_64-4G-efi-routeros-bypass-v2
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: inputs.publish_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "routeros-bypass-v2-24.10.6-${{ github.run_number }}"
+          name: "ImmortalWrt 24.10.6 RouterOS Bypass Stable V2 #${{ github.run_number }}"
+          files: out/*
+          generate_release_notes: true
