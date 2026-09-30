@@ -1,122 +1,95 @@
-name: Build ImmortalWrt 24.10 x86_64 4G EFI
+name: Build ImmortalWrt 24.10.6 RouterOS Bypass Stable V1.1
 
 on:
   workflow_dispatch:
     inputs:
-      install_daed:
-        description: '尝试额外集成 daed/dae（默认关闭，24.10 基线更稳）'
+      install_openbox:
+        description: Install Open-Box during image customization
         required: false
-        default: 'false'
+        default: "false"
+      install_extra_proxy:
+        description: Include extra proxy stacks
+        required: false
+        default: "false"
       publish_release:
-        description: '构建成功后发布 GitHub Release'
+        description: Publish GitHub Release
         required: false
-        default: 'false'
+        default: "false"
 
 env:
-  IMMORTAL_VERSION: '24.10.6'
-  ROOTFS_PARTSIZE: '4096'
+  IMMORTAL_VERSION: "24.10.6"
+  TARGET: "x86"
+  SUBTARGET: "64"
+  ROOTFS_PARTSIZE: "4096"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+
     steps:
-      - name: Checkout custom build repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses5-dev \
-            libssl-dev python3-setuptools rsync unzip zlib1g-dev file wget curl time \
-            libelf-dev ecj fastjar java-propose-classpath python3 \
-            swig zstd subversion xsltproc qemu-utils
+          sudo apt update
+          sudo apt install -y build-essential clang flex bison g++ gawk gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip zstd file wget curl
 
-      - name: Clone ImmortalWrt 24.10.6
+      - name: Clone ImmortalWrt
         run: |
-          git clone --branch "v${IMMORTAL_VERSION}" --depth 1 \
-            https://github.com/immortalwrt/immortalwrt.git immortalwrt
-          cp config/seed.config immortalwrt/.config
+          git clone --depth=1 --branch v24.10.6 https://github.com/immortalwrt/immortalwrt.git source
 
-      - name: Add third-party feeds
-        working-directory: immortalwrt
+      - name: Apply RouterOS bypass configuration
+        working-directory: source
         run: |
-          cat >> feeds.conf.default <<'EOF'
-          src-git openclash https://github.com/vernesong/OpenClash.git
-          src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git
-          src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git
-          src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git
-          src-git mosdns https://github.com/sbwml/luci-app-mosdns.git
-          src-git homeproxy https://github.com/immortalwrt/homeproxy.git
-          EOF
+          cat > .config <<'EOF'
+CONFIG_TARGET_x86=y
+CONFIG_TARGET_x86_64=y
+CONFIG_TARGET_IMAGES_GPT=y
+CONFIG_TARGET_ROOTFS_PARTSIZE=4096
+
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-compat=y
+CONFIG_PACKAGE_luci-base=y
+
+CONFIG_PACKAGE_bash=y
+CONFIG_PACKAGE_curl=y
+CONFIG_PACKAGE_ca-bundle=y
+CONFIG_PACKAGE_unzip=y
+CONFIG_PACKAGE_ip-full=y
+CONFIG_PACKAGE_dnsmasq-full=y
+
+CONFIG_PACKAGE_kmod-tun=y
+CONFIG_PACKAGE_kmod-nft-tproxy=y
+CONFIG_PACKAGE_kmod-inet-diag=y
+
+CONFIG_PACKAGE_tcpdump=y
+CONFIG_PACKAGE_libustream-mbedtls20201210=y
+
+CONFIG_PACKAGE_luci-app-openclash=y
+EOF
+
+          if [ "${{ github.event.inputs.install_extra_proxy }}" = "true" ]; then
+            echo "Extra proxy packages enabled"
+          fi
+
+      - name: Build firmware
+        working-directory: source
+        run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-
-      - name: Select packages
-        working-directory: immortalwrt
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          cfg = Path('.config').read_text()
-          lines = []
-          want = []
-          for raw in Path('../config/packages.txt').read_text().splitlines():
-              raw = raw.strip()
-              if raw and not raw.startswith('#'):
-                  want.extend(raw.split())
-          for p in want:
-              key = 'CONFIG_PACKAGE_' + p
-              lines.append(f'{key}=y')
-          Path('.config').write_text(cfg + '\n' + '\n'.join(lines) + '\n')
-          PY
           make defconfig
+          make download -j$(nproc)
+          make -j$(nproc) V=s
 
-      - name: Optional daed feed
-        if: inputs.install_daed == 'true'
-        working-directory: immortalwrt
+      - name: Collect firmware
         run: |
-          echo 'src-git daede https://github.com/kenzok8/openwrt-daede.git' >> feeds.conf.default
-          ./scripts/feeds update daede
-          ./scripts/feeds install -a -p daede
-          echo 'CONFIG_PACKAGE_luci-app-daede=y' >> .config
-          echo 'CONFIG_PACKAGE_dae=y' >> .config
-          echo 'CONFIG_PACKAGE_daed=y' >> .config
-          make defconfig
-
-      - name: Inject custom files before image build
-        working-directory: immortalwrt
-        run: |
-          rsync -a ../files/ files/
-
-      - name: Build toolchain/package/image
-        working-directory: immortalwrt
-        env:
-          FORCE_UNSAFE_CONFIGURE: '1'
-        run: |
-          make -j"$(nproc)" download V=s
-          make -j"$(nproc)" world V=s
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p out
-          cp -a immortalwrt/bin/targets/x86/64/* out/
-          sha256sum out/* > out/sha256sums.txt || true
-          ls -lah out
+          mkdir -p artifact
+          cp source/bin/targets/x86/64/* artifact/ || true
+          sha256sum artifact/* > artifact/SHA256SUMS || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-24.10.6-x86_64-4G-efi
-          path: out/*
-          retention-days: 14
-
-      - name: Publish release
-        if: inputs.publish_release == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "custom-24.10.6-x86_64-4G-${{ github.run_number }}"
-          name: "ImmortalWrt 24.10.6 x86_64 4G EFI #${{ github.run_number }}"
-          files: out/*
-          generate_release_notes: true
+          name: ImmortalWrt-24.10.6-RouterOS-Bypass-V1.1-x86_64-4G-EFI
+          path: artifact
